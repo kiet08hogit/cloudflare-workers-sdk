@@ -79,6 +79,191 @@ function getTarget(props: Props): RegistryEntry | undefined {
 	return resolveTarget(props.service);
 }
 
+/**
+ * workerd pins a cross-process RPC session to every object result, including
+ * plain data, until `Symbol.dispose` runs. Stubs and functions must keep that
+ * session. Dispose is not itself a stub: plain results carry it too.
+ */
+function isLiveRpcHandle(value: object): boolean {
+	if (value instanceof RpcTarget) {
+		return true;
+	}
+	const name = value.constructor?.name;
+	return name === "RpcStub" || name === "RpcProperty" || name === "RpcPromise";
+}
+
+function isPlainData(value: object): boolean {
+	if (Array.isArray(value) || ArrayBuffer.isView(value)) {
+		return true;
+	}
+	if (
+		value instanceof Date ||
+		value instanceof Map ||
+		value instanceof Set ||
+		value instanceof ArrayBuffer
+	) {
+		return true;
+	}
+	const proto = Object.getPrototypeOf(value) as object | null;
+	return proto === Object.prototype || proto === null;
+}
+
+function containsLiveRpcHandle(
+	value: unknown,
+	seen = new Set<object>()
+): boolean {
+	if (typeof value === "function") {
+		return true;
+	}
+	if (value === null || typeof value !== "object") {
+		return false;
+	}
+	if (seen.has(value)) {
+		return false;
+	}
+	seen.add(value);
+	if (!isPlainData(value) || isLiveRpcHandle(value)) {
+		return true;
+	}
+	if (value instanceof Map) {
+		for (const [key, child] of value) {
+			if (
+				containsLiveRpcHandle(key, seen) ||
+				containsLiveRpcHandle(child, seen)
+			) {
+				return true;
+			}
+		}
+		return false;
+	}
+	if (value instanceof Set) {
+		for (const child of value) {
+			if (containsLiveRpcHandle(child, seen)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
+		return false;
+	}
+	for (const key of Reflect.ownKeys(value)) {
+		if (key === Symbol.dispose || key === Symbol.asyncDispose) {
+			continue;
+		}
+		const child = (value as Record<string | symbol, unknown>)[key];
+		if (typeof child === "function" || containsLiveRpcHandle(child, seen)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Copy a plain RPC result and release its session. Live stubs are returned
+ * as-is so their connection stays up. The cached debug-port client is not
+ * touched.
+ *
+ * @param result - Value returned by a remote service-binding call.
+ * @returns A clone when `result` is plain data, otherwise `result`.
+ */
+function releasePlainRpcResult<T>(result: T): T {
+	if (result === null || typeof result !== "object") {
+		return result;
+	}
+	if (containsLiveRpcHandle(result)) {
+		return result;
+	}
+	const dispose = (result as { [Symbol.dispose]?: () => void })[Symbol.dispose];
+	try {
+		const copy = structuredClone(snapshotPlainData(result));
+		dispose?.call(result);
+		return copy as T;
+	} catch {
+		return result;
+	}
+}
+
+function snapshotPlainData(
+	value: unknown,
+	seen = new Map<object, unknown>()
+): unknown {
+	if (value === null || typeof value !== "object") {
+		return value;
+	}
+	const existing = seen.get(value);
+	if (existing !== undefined) {
+		return existing;
+	}
+	if (value instanceof Date) {
+		return new Date(value.getTime());
+	}
+	if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
+		return structuredClone(value);
+	}
+	if (value instanceof Map) {
+		const copy = new Map();
+		seen.set(value, copy);
+		for (const [key, child] of value) {
+			copy.set(snapshotPlainData(key, seen), snapshotPlainData(child, seen));
+		}
+		return copy;
+	}
+	if (value instanceof Set) {
+		const copy = new Set();
+		seen.set(value, copy);
+		for (const child of value) {
+			copy.add(snapshotPlainData(child, seen));
+		}
+		return copy;
+	}
+	if (Array.isArray(value)) {
+		const copy: unknown[] = [];
+		seen.set(value, copy);
+		for (const child of value) {
+			copy.push(snapshotPlainData(child, seen));
+		}
+		return copy;
+	}
+	const copy: Record<string, unknown> = {};
+	seen.set(value, copy);
+	for (const key of Object.keys(value)) {
+		copy[key] = snapshotPlainData(
+			(value as Record<string, unknown>)[key],
+			seen
+		);
+	}
+	return copy;
+}
+
+/**
+ * Forward one remote property. Methods run with the remote fetcher as `this`,
+ * then plain results are released.
+ */
+function forwardRemoteProperty(
+	fetcher: Fetcher,
+	prop: string | symbol
+): unknown {
+	const value: unknown = Reflect.get(fetcher, prop);
+	if (typeof value !== "function") {
+		return releasePlainRpcResult(value);
+	}
+	return (...args: unknown[]) => {
+		const result: unknown = Reflect.apply(value, fetcher, args);
+		if (
+			typeof result === "object" &&
+			result !== null &&
+			"then" in result &&
+			typeof result.then === "function"
+		) {
+			return (result as Promise<unknown>).then((resolved) =>
+				releasePlainRpcResult(resolved)
+			);
+		}
+		return releasePlainRpcResult(result);
+	};
+}
+
 function resolve(props: Props, env: Env, target: RegistryEntry): Fetcher {
 	const { service, entrypoint, userProps, storage } = props;
 
@@ -180,7 +365,7 @@ export class ExternalServiceProxy extends WorkerEntrypoint<Env, Props> {
 				if (!fetcher) {
 					throw new Error(workerNotFoundMessage(ctx.props.service));
 				}
-				return Reflect.get(fetcher, prop);
+				return forwardRemoteProperty(fetcher, prop);
 			},
 		});
 	}

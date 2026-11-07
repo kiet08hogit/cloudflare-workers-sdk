@@ -1,3 +1,5 @@
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { watch } from "chokidar";
@@ -15,6 +17,86 @@ import type {
 	WorkerDefinition,
 	WorkerRegistry,
 } from "miniflare";
+
+/**
+ * Count ESTABLISHED TCP sockets that use `port`. Both ends of a loopback
+ * connection show up, so compare a sample with a baseline.
+ *
+ * @param port - TCP port to match, usually a remote workerd debug port.
+ * @returns How many established sockets name that port.
+ */
+function countEstablished(port: number): number {
+	if (process.platform === "linux") {
+		return countProcNetTcp(port);
+	}
+	if (process.platform === "win32") {
+		return countNetstat(port);
+	}
+	return countLsof(port);
+}
+
+function countProcNetTcp(port: number): number {
+	const hexPort = port.toString(16).toUpperCase();
+	let count = 0;
+	for (const file of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+		let text = "";
+		try {
+			text = readFileSync(file, "utf8");
+		} catch {
+			continue;
+		}
+		for (const line of text.split("\n").slice(1)) {
+			const parts = line.trim().split(/\s+/);
+			if (parts.length < 4 || parts[3] !== "01") {
+				continue;
+			}
+			if (
+				addressHasPort(parts[1] ?? "", hexPort) ||
+				addressHasPort(parts[2] ?? "", hexPort)
+			) {
+				count++;
+			}
+		}
+	}
+	return count;
+}
+
+function addressHasPort(address: string, hexPort: string): boolean {
+	return address.split(":").at(-1)?.toUpperCase() === hexPort;
+}
+
+function countLsof(port: number): number {
+	let output = "";
+	try {
+		output = execFileSync("lsof", ["-nP", "-iTCP", "-sTCP:ESTABLISHED"], {
+			encoding: "utf8",
+		});
+	} catch {
+		return 0;
+	}
+	return output.split("\n").filter((line) => lineTouchesPort(line, port))
+		.length;
+}
+
+function countNetstat(port: number): number {
+	let output = "";
+	try {
+		output = execFileSync("netstat", ["-ano", "-p", "tcp"], {
+			encoding: "utf8",
+		});
+	} catch {
+		return 0;
+	}
+	return output
+		.split("\n")
+		.filter(
+			(line) => line.includes("ESTABLISHED") && lineTouchesPort(line, port)
+		).length;
+}
+
+function lineTouchesPort(line: string, port: number): boolean {
+	return new RegExp(`(?:^|[^\\d]):${port}(?:[^\\d]|$)`).test(line);
+}
 
 describe("DevRegistry", { concurrent: false }, () => {
 	test("waits for the filesystem watcher to be ready", async ({ expect }) => {
@@ -1659,6 +1741,123 @@ describe("DevRegistry", { concurrent: false }, () => {
 			},
 			{ timeout: 10_000, interval: 100 }
 		);
+	});
+
+	test("plain service-binding RPC results release the cross-process session", async ({
+		expect,
+	}) => {
+		const unsafeDevRegistryPath = await useTmp();
+		const remote = new Miniflare({
+			unsafeDevRegistryPath,
+			workers: [
+				{
+					dev: { unsafeRegisterWorker: true },
+					config: {
+						name: "rpc-callee",
+						compatibilityDate: "2025-05-01",
+						compatibilityFlags: ["experimental"],
+						manifest: singleModuleManifest(`
+				import { RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
+				class Item extends RpcTarget {
+					id() { return "stub-ok"; }
+				}
+				export class DataService extends WorkerEntrypoint {
+					getSomething() { return { name: "hello" }; }
+					get5() { return 5; }
+					getStub() { return new Item(); }
+				}
+				export default { fetch() { return new Response("callee"); } };
+			`),
+					},
+				},
+			],
+		});
+		useDispose(remote);
+		await remote.ready;
+
+		const local = new Miniflare({
+			unsafeDevRegistryPath,
+			workers: [
+				{
+					config: {
+						name: "rpc-caller",
+						compatibilityDate: "2025-05-01",
+						compatibilityFlags: ["experimental"],
+						manifest: singleModuleManifest(`
+				export default {
+					async fetch(request, env) {
+						const url = new URL(request.url);
+						const mode = url.searchParams.get("mode");
+						const n = Number(url.searchParams.get("n") ?? 1);
+						const hold = Number(url.searchParams.get("hold") ?? 0);
+						if (mode === "stub") {
+							const stub = await env.SERVICE.getStub();
+							return new Response(await stub.id());
+						}
+						let last = "";
+						for (let i = 0; i < n; i++) {
+							if (mode === "number") last = String(await env.SERVICE.get5());
+							else last = (await env.SERVICE.getSomething()).name;
+						}
+						if (hold) await new Promise((resolve) => setTimeout(resolve, hold));
+						return new Response(last);
+					}
+				}
+			`),
+						env: {
+							SERVICE: {
+								type: "worker",
+								worker: "rpc-callee",
+								exportName: "DataService",
+							},
+						},
+					},
+				},
+			],
+		});
+		useDispose(local);
+
+		await vi.waitFor(
+			async () => {
+				const res = await local.dispatchFetch(
+					"http://placeholder/?mode=number&n=1&hold=0"
+				);
+				expect(await res.text()).toBe("5");
+				expect(res.status).toBe(200);
+			},
+			{ timeout: 10_000, interval: 100 }
+		);
+
+		const registry = getWorkerRegistry(unsafeDevRegistryPath);
+		const address = registry["rpc-callee"]?.debugPortAddress;
+		expect(address).toBeTruthy();
+		const port = Number(address?.split(":").at(-1));
+		expect(port).toBeGreaterThan(0);
+
+		const baseline = countEstablished(port);
+		const objectCall = local.dispatchFetch(
+			"http://placeholder/?mode=object&n=40&hold=4000"
+		);
+		await new Promise((resolve) => setTimeout(resolve, 2000));
+		const duringObject = countEstablished(port);
+		const objectResponse = await objectCall;
+		expect(await objectResponse.text()).toBe("hello");
+		expect(duringObject - baseline).toBeLessThan(10);
+
+		const numberCall = local.dispatchFetch(
+			"http://placeholder/?mode=number&n=40&hold=4000"
+		);
+		await new Promise((resolve) => setTimeout(resolve, 2000));
+		const duringNumber = countEstablished(port);
+		const numberResponse = await numberCall;
+		expect(await numberResponse.text()).toBe("5");
+		expect(duringNumber - baseline).toBeLessThan(10);
+
+		const stubResponse = await local.dispatchFetch(
+			"http://placeholder/?mode=stub"
+		);
+		expect(await stubResponse.text()).toBe("stub-ok");
+		expect(stubResponse.status).toBe(200);
 	});
 
 	test("cross-process bindings and tail consumers survive a local workerd crash restart", async ({
